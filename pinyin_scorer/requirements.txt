@@ -1,0 +1,6 @@
+torch>=2.3
+transformers>=4.40
+pypinyin>=0.50
+soundfile>=0.12
+scipy
+numpy
