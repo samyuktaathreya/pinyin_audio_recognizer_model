@@ -31,6 +31,9 @@ def main():
                    default=["gitcode", "studycli", "uvm", "shikangkai_f"])
     p.add_argument("--skip-sources", nargs="*", default=["youtube_man"],
                    help="folders to ignore entirely (youtube_man has no tone numbers)")
+    p.add_argument("--no-augment-sources", nargs="*", default=[],
+                   help="folders that already have real background noise; "
+                        "training will never add extra noise to these")
     args = p.parse_args()
 
     out = Path(args.out_dir)
@@ -55,13 +58,17 @@ def main():
             except Exception:
                 bad += 1
                 continue
-            rows.append({"audio": str(f.resolve()), "duration": round(duration, 3),
-                         "pinyin": syllable, "speaker": src.name})
+            row = {"audio": str(f.resolve()), "duration": round(duration, 3),
+                   "pinyin": syllable, "speaker": src.name}
+            if src.name in args.no_augment_sources:
+                row["augment"] = False
+            rows.append(row)
         which = "test" if src.name in args.test_sources else "train"
         split[which] += rows
         if which == "test":
             per_source[src.name] = rows
-        print(f"{src.name:16} {which:5} {len(rows):6} clips" + (f"  ({bad} skipped)" if bad else ""))
+        note = "  (no added noise)" if src.name in args.no_augment_sources else ""
+        print(f"{src.name:16} {which:5} {len(rows):6} clips" + (f"  ({bad} skipped)" if bad else "") + note)
 
     missing = set(args.test_sources) - set(per_source)
     if missing:

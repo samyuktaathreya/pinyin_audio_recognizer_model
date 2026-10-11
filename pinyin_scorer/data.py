@@ -54,19 +54,33 @@ def read_manifests(paths, max_seconds=16.0):
     return rows
 
 
+def speech_power(wav, frame=160):
+    """Average power of the loud part of a clip (its top 30% of 10 ms frames).
+    Averaging over the whole clip would count silence and make added noise too loud."""
+    n = len(wav) // frame
+    if n == 0:
+        return float(np.mean(wav ** 2)) + 1e-10
+    power = (wav[:n * frame].reshape(n, frame) ** 2).mean(axis=1)
+    loud = np.sort(power)[-max(1, int(0.3 * n)):]
+    return float(loud.mean()) + 1e-10
+
+
 def augment_audio(wav, rng):
     """Make a clean clip sound more like a learner's recording: extra silence at the
-    edges, a different volume, and background noise at a random loudness."""
-    speech_power = float(np.mean(wav ** 2)) + 1e-10
+    edges, a different volume, and occasionally faint background hiss.
+
+    The hiss is kept quiet on purpose (25-40 dB below the speech). Louder noise was
+    tried and buried quiet consonants like x, s and f, so the model was being trained on
+    clips a human couldn't recognise. Real-world noise comes from the noisy recordings
+    already in the training data instead."""
+    power = speech_power(wav)
     if rng.random() < 0.5:
         pre, post = (rng.uniform(0, 0.4, 2) * SAMPLE_RATE).astype(int)
         wav = np.concatenate([np.zeros(pre, np.float32), wav, np.zeros(post, np.float32)])
-    if rng.random() < 0.5:
-        # Hiss only. An earlier version also added low rumble, which overlaps the pitch
-        # range that carries tone; that run's tone accuracy got worse, so it was removed.
+    if rng.random() < 0.3:
         noise = rng.standard_normal(len(wav)).astype(np.float32)
-        snr_db = rng.uniform(10, 30)
-        noise *= np.sqrt(speech_power / 10 ** (snr_db / 10) / (np.mean(noise ** 2) + 1e-10))
+        snr_db = rng.uniform(25, 40)
+        noise *= np.sqrt(power / 10 ** (snr_db / 10) / (np.mean(noise ** 2) + 1e-10))
         wav = wav + noise
     wav = wav * 10 ** (rng.uniform(-6, 3) / 20)
     return np.clip(wav, -1.0, 1.0).astype(np.float32)
@@ -83,7 +97,7 @@ class ClipDataset(Dataset):
     def __getitem__(self, i):
         row = self.rows[i]
         wav = load_audio(row["audio"])
-        if self.augment:
+        if self.augment and row.get("augment", True):
             # seeded from torch so each DataLoader worker gets different noise
             wav = augment_audio(wav, np.random.default_rng(torch.randint(0, 2**31, (1,)).item()))
         return {"wav": wav, "labels": row["labels"]}
