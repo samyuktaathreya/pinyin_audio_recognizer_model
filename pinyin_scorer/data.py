@@ -19,14 +19,32 @@ from pinyin_units import HEADS, encode
 SAMPLE_RATE = 16000
 
 
+TARGET_DBFS = -20.0      # loudness every clip is scaled to (typical speech level)
+MAX_GAIN_DB = 40.0       # never boost more than this, so near-silent clips don't become loud hiss
+
+
+def normalize_loudness(wav, target_dbfs=TARGET_DBFS):
+    """Scale a clip so its speech has the same loudness as every other clip.
+
+    The model sees raw sample values, so without this a quiet recording (studycli) and
+    a loud one look very different to it even when the speech is identical. Training,
+    evaluation and the app all go through this, so the model always hears the same level."""
+    gain_db = target_dbfs - 10 * np.log10(speech_power(wav))
+    wav = wav * 10 ** (min(gain_db, MAX_GAIN_DB) / 20)
+    peak = float(np.abs(wav).max()) if len(wav) else 0.0
+    if peak > 0.99:                       # loud consonant bursts: scale down instead of clipping
+        wav = wav * (0.99 / peak)
+    return wav.astype(np.float32)
+
+
 def load_audio(path, min_seconds=0.5):
-    """Mono float32 at 16 kHz, padded with silence up to min_seconds."""
+    """Mono float32 at 16 kHz, loudness-normalized, padded with silence up to min_seconds."""
     wav, sr = sf.read(path, dtype="float32", always_2d=True)
     wav = wav.mean(axis=1)
     if sr != SAMPLE_RATE:
         g = gcd(sr, SAMPLE_RATE)
         wav = resample_poly(wav, SAMPLE_RATE // g, sr // g).astype(np.float32)
-    return pad_audio(wav, min_seconds)
+    return pad_audio(normalize_loudness(wav), min_seconds)
 
 
 def pad_audio(wav, min_seconds=0.5):
@@ -82,7 +100,7 @@ def augment_audio(wav, rng):
         snr_db = rng.uniform(25, 40)
         noise *= np.sqrt(power / 10 ** (snr_db / 10) / (np.mean(noise ** 2) + 1e-10))
         wav = wav + noise
-    wav = wav * 10 ** (rng.uniform(-6, 3) / 20)
+    wav = wav * 10 ** (rng.uniform(-3, 3) / 20)   # small: every clip is loudness-normalized anyway
     return np.clip(wav, -1.0, 1.0).astype(np.float32)
 
 

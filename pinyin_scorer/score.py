@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from data import SAMPLE_RATE, load_audio, pad_audio
+from data import SAMPLE_RATE, load_audio, normalize_loudness, pad_audio
 from model import PinyinCTC
 from pinyin_units import HEADS, VOCABS, display, split_syllable
 
@@ -54,7 +54,7 @@ class Scorer:
         if parts is None:
             raise ValueError(f"not a pinyin syllable with tone: {target!r}")
         wav = load_audio(audio) if isinstance(audio, str) else pad_audio(
-            np.asarray(audio, dtype=np.float32))
+            normalize_loudness(np.asarray(audio, dtype=np.float32)))
         feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
         logits = self.model(feats["input_values"].to(self.device))
 
