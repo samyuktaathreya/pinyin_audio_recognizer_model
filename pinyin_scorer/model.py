@@ -19,19 +19,25 @@ DEFAULT_ENCODER = "TencentGameMate/chinese-wav2vec2-base"
 
 
 class PinyinCTC(nn.Module):
-    def __init__(self, encoder, dropout=0.1):
+    def __init__(self, encoder, dropout=0.1, per_head_mix=False):
         super().__init__()
         self.encoder = encoder
         hidden = encoder.config.hidden_size
         n_layers = encoder.config.num_hidden_layers + 1          # + the input to layer 1
-        self.layer_weights = nn.Parameter(torch.zeros(n_layers))  # starts as an equal mix
+        # One mix shared by the three heads (shape: layers), or one mix for each head
+        # (shape: heads x layers) so that, say, the tone head can lean on different
+        # layers than the initial head. Zeros = an equal mix.
+        self.per_head_mix = per_head_mix
+        shape = (len(HEADS), n_layers) if per_head_mix else (n_layers,)
+        self.layer_weights = nn.Parameter(torch.zeros(shape))
         self.norm = nn.LayerNorm(hidden)
         self.dropout = nn.Dropout(dropout)
         self.heads = nn.ModuleDict(
             {h: nn.Linear(hidden, len(VOCABS[h])) for h in HEADS})
 
     @classmethod
-    def from_encoder(cls, name=DEFAULT_ENCODER, mask_time_prob=0.05, dropout=0.1):
+    def from_encoder(cls, name=DEFAULT_ENCODER, mask_time_prob=0.05, dropout=0.1,
+                     per_head_mix=False):
         """Fresh model: pretrained encoder + untrained layer mix and heads."""
         encoder = Wav2Vec2Model.from_pretrained(
             name,
@@ -41,21 +47,29 @@ class PinyinCTC(nn.Module):
             mask_feature_prob=0.0,
             layerdrop=0.0,
         )
-        return cls(encoder, dropout)
+        return cls(encoder, dropout, per_head_mix)
 
     @classmethod
-    def load(cls, model_dir, mask_time_prob=None):
-        """Load a model written by save()."""
+    def load(cls, model_dir, mask_time_prob=None, per_head_mix=False):
+        """Load a model written by save().
+
+        A model saved with one mix per head always loads that way. per_head_mix=True also
+        converts a model saved with a single shared mix (such as stage 2): every head
+        starts from a copy of the shared mix, so the model's answers are unchanged until
+        training moves the copies apart."""
         model_dir = Path(model_dir)
         kwargs = {} if mask_time_prob is None else {"mask_time_prob": mask_time_prob}
         encoder = Wav2Vec2Model.from_pretrained(model_dir / "encoder", **kwargs)
-        model = cls(encoder)
         top = model_dir / "top.pt"
         if not top.exists():
             raise FileNotFoundError(f"{top} not found; this model was saved by an older version "
                                     "of the code and can't be loaded. Retrain it.")
-        missing, unexpected = model.load_state_dict(
-            torch.load(top, map_location="cpu"), strict=False)
+        state = torch.load(top, map_location="cpu")
+        saved_per_head = state["layer_weights"].dim() == 2
+        if per_head_mix and not saved_per_head:
+            state["layer_weights"] = state["layer_weights"].repeat(len(HEADS), 1)
+        model = cls(encoder, per_head_mix=per_head_mix or saved_per_head)
+        missing, unexpected = model.load_state_dict(state, strict=False)
         missing = [k for k in missing if not k.startswith("encoder.")]
         if missing or unexpected:
             raise RuntimeError(f"bad checkpoint: missing={missing} unexpected={unexpected}")
@@ -76,7 +90,9 @@ class PinyinCTC(nn.Module):
         return [p for n, p in self.named_parameters() if not n.startswith("encoder.")]
 
     def layer_mix(self):
-        return F.softmax(self.layer_weights, dim=0).tolist()
+        """Share of each layer in the mix: a list, or {head: list} with one mix per head."""
+        mix = F.softmax(self.layer_weights, dim=-1).tolist()
+        return dict(zip(HEADS, mix)) if self.per_head_mix else mix
 
     @staticmethod
     def load_feature_extractor(name_or_dir):
@@ -91,10 +107,16 @@ class PinyinCTC(nn.Module):
         out = self.encoder(input_values, attention_mask=attention_mask,
                            output_hidden_states=True)
         layers = torch.stack(out.hidden_states, dim=0)                # (L, B, T, D)
-        weights = F.softmax(self.layer_weights, dim=0).to(layers.dtype)
-        hidden = (weights.view(-1, 1, 1, 1) * layers).sum(dim=0)
-        hidden = self.dropout(self.norm(hidden))
-        return {h: head(hidden) for h, head in self.heads.items()}   # each (B, T, vocab)
+        weights = F.softmax(self.layer_weights, dim=-1).to(layers.dtype)
+        if not self.per_head_mix:
+            hidden = (weights.view(-1, 1, 1, 1) * layers).sum(dim=0)
+            hidden = self.dropout(self.norm(hidden))
+            return {h: head(hidden) for h, head in self.heads.items()}   # each (B, T, vocab)
+        logits = {}
+        for i, h in enumerate(HEADS):
+            hidden = (weights[i].view(-1, 1, 1, 1) * layers).sum(dim=0)
+            logits[h] = self.heads[h](self.dropout(self.norm(hidden)))
+        return logits
 
 
 def ctc_losses(logits, frame_lengths, labels, label_lengths):

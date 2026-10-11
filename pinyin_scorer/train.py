@@ -35,10 +35,10 @@ def edit_distance(a, b):
     return prev[-1]
 
 
-def make_loader(rows, collator, args, shuffle, augment=False):
+def make_loader(rows, collator, args, shuffle, augment=False, voice_augment=False):
     sampler = DurationBatchSampler(rows, args.batch_seconds, args.max_batch_size, shuffle, args.seed)
-    return DataLoader(ClipDataset(rows, augment=augment), batch_sampler=sampler,
-                      collate_fn=collator, num_workers=args.workers)
+    return DataLoader(ClipDataset(rows, augment=augment, voice_augment=voice_augment),
+                      batch_sampler=sampler, collate_fn=collator, num_workers=args.workers)
 
 
 def run_model(model, batch, device, use_amp):
@@ -110,6 +110,11 @@ def main():
     p.add_argument("--no-amp", action="store_true", help="turn off mixed precision")
     p.add_argument("--augment", action="store_true",
                    help="add background noise, volume changes and edge silence to training clips")
+    p.add_argument("--voice-augment", action="store_true",
+                   help="randomly shift the voice (up to 2 semitones) and the speaking speed of "
+                        "single-syllable training clips, so few speakers sound like many")
+    p.add_argument("--per-head-mix", action="store_true",
+                   help="give each head its own mix of the encoder's layers instead of one shared mix")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -119,10 +124,12 @@ def main():
     use_amp = device.type == "cuda" and not args.no_amp
 
     if args.init_from:
-        model = PinyinCTC.load(args.init_from, mask_time_prob=args.mask_time_prob)
+        model = PinyinCTC.load(args.init_from, mask_time_prob=args.mask_time_prob,
+                               per_head_mix=args.per_head_mix)
         feature_extractor = PinyinCTC.load_feature_extractor(args.init_from)
     else:
-        model = PinyinCTC.from_encoder(args.encoder, mask_time_prob=args.mask_time_prob)
+        model = PinyinCTC.from_encoder(args.encoder, mask_time_prob=args.mask_time_prob,
+                                       per_head_mix=args.per_head_mix)
         feature_extractor = PinyinCTC.load_feature_extractor(args.encoder)
     model.encoder.freeze_feature_encoder()   # the convolutional front end stays fixed
     model.to(device)
@@ -137,7 +144,8 @@ def main():
         raise SystemExit("--train is required unless --eval-only is set")
 
     train_rows = read_manifests(args.train)
-    train_loader = make_loader(train_rows, collator, args, shuffle=True, augment=args.augment)
+    train_loader = make_loader(train_rows, collator, args, shuffle=True, augment=args.augment,
+                               voice_augment=args.voice_augment)
     hours = sum(r["duration"] for r in train_rows) / 3600
     print(f"{len(train_rows)} training clips, {hours:.1f} hours, "
           f"{len(train_loader)} batches per epoch, device={device}, amp={use_amp}")
@@ -200,6 +208,9 @@ def main():
             continue
         metrics = evaluate(model, dev_loader, device, use_amp)
         show(f"epoch {epoch}", metrics)
+        if model.per_head_mix:   # which layers each head has come to rely on
+            for h, mix in model.layer_mix().items():
+                print(f"  {h:7} layer mix: " + " ".join(f"{w:.2f}" for w in mix), flush=True)
         with open(out / "log.jsonl", "a") as f:
             f.write(json.dumps({"epoch": epoch, **metrics}) + "\n")
         model.save(out / "last", feature_extractor)

@@ -104,10 +104,43 @@ def augment_audio(wav, rng):
     return np.clip(wav, -1.0, 1.0).astype(np.float32)
 
 
+VOICE_SEMITONES = 2.0          # how far the voice is shifted up or down, at most
+TEMPO_RANGE = (0.85, 1.2)      # how much faster or slower the syllable is said, at most
+
+
+def change_voice(wav, rng):
+    """Make one speaker sound like a slightly different one, without changing which
+    initial, final or tone was said.
+
+    Two independent random changes:
+      voice: pitch and vowel resonances move together by up to 2 semitones, the way they
+             differ between a larger and a smaller speaker.
+      tempo: the syllable is said up to 15% slower or 20% faster, at the same pitch.
+
+    The tone label stays right because the SHAPE of the pitch movement is untouched; only
+    its height and its length change. The voice shift is kept to 2 semitones because it
+    also moves the vowel resonances, and a larger shift starts to turn one vowel into
+    another."""
+    import librosa   # imported here so scoring and the app don't need librosa installed
+
+    voice = 2 ** (rng.uniform(-VOICE_SEMITONES, VOICE_SEMITONES) / 12)
+    tempo = rng.uniform(*TEMPO_RANGE)
+    n = len(wav)
+    # Playing the clip back at a different rate shifts pitch and resonances together,
+    # but also changes its length by 1/voice.
+    wav = resample_poly(wav, 1000, int(round(1000 * voice))).astype(np.float32)
+    # Stretch in time (pitch unchanged) so the final length is n / tempo.
+    rate = len(wav) * tempo / n
+    if abs(rate - 1) > 0.02:
+        wav = librosa.effects.time_stretch(wav, rate=rate, n_fft=512)
+    return pad_audio(normalize_loudness(wav.astype(np.float32)))
+
+
 class ClipDataset(Dataset):
-    def __init__(self, rows, augment=False):
+    def __init__(self, rows, augment=False, voice_augment=False):
         self.rows = rows
         self.augment = augment
+        self.voice_augment = voice_augment
 
     def __len__(self):
         return len(self.rows)
@@ -115,9 +148,13 @@ class ClipDataset(Dataset):
     def __getitem__(self, i):
         row = self.rows[i]
         wav = load_audio(row["audio"])
+        # seeded from torch so each DataLoader worker gets different random changes
+        rng = np.random.default_rng(torch.randint(0, 2**31, (1,)).item())
+        # Only single syllables: sentences already come from hundreds of speakers.
+        if self.voice_augment and len(row["labels"]["tone"]) == 1 and rng.random() < 0.8:
+            wav = change_voice(wav, rng)
         if self.augment and row.get("augment", True):
-            # seeded from torch so each DataLoader worker gets different noise
-            wav = augment_audio(wav, np.random.default_rng(torch.randint(0, 2**31, (1,)).item()))
+            wav = augment_audio(wav, rng)
         return {"wav": wav, "labels": row["labels"]}
 
 
