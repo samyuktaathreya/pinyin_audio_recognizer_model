@@ -86,7 +86,10 @@ def main():
                     continue
                 parts = split_syllable(r["pinyin"])
                 writer.writerow({
-                    "source": source, "audio": r["audio"], "target": r["pinyin"],
+                    # Prefer the manifest's own speaker label, so a manifest that holds
+                    # several sources (like good/train.jsonl) keeps them apart.
+                    "source": r.get("speaker") or source,
+                    "audio": r["audio"], "target": r["pinyin"],
                     "seconds": round(seconds, 3),
                     **{f"target_{h}": str(want) for h, want in zip(HEADS, parts)},
                     **scores,
