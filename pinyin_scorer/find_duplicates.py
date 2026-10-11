@@ -53,6 +53,7 @@ def main():
     p.add_argument("--max-frames-apart", type=int, default=2, help="2 = within 20 ms")
     p.add_argument("--min-similarity", type=float, default=0.95)
     p.add_argument("--out", default="duplicate_examples.csv")
+    p.add_argument("--summary", default="duplicate_pairs.csv")
     args = p.parse_args()
 
     sources = [Path(f) for f in args.folders if Path(f).is_dir()]
@@ -100,6 +101,12 @@ def main():
     for (a, b), (shared, same_len, same) in rows:
         flag = "   <-- check" if shared and same / shared > 0.3 else ""
         print(f"{a:16} {b:16} {shared:7d} {same_len / shared:12.0%} {same / shared:16.0%}{flag}")
+
+    with open(args.summary, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["source_a", "source_b", "shared", "same_recording_fraction"])
+        for (a, b), (shared, _, same) in rows:
+            writer.writerow([a, b, shared, round(same / shared, 3) if shared else 0])
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["source_a", "source_b", "syllable",
