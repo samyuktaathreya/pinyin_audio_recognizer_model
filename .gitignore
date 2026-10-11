@@ -1,2 +1,3 @@
 .venv/*
 processed/*
+pinyin_scorer/__pycache__/*
