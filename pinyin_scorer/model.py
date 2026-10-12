@@ -1,4 +1,4 @@
-"""One shared wav2vec2 encoder with three CTC heads: initial, final, tone.
+"""One shared speech encoder (wav2vec2 or HuBERT) with three CTC heads: initial, final, tone.
 
 The heads read a learned weighted mix of ALL the encoder's layers, not just the last one.
 In a pretrained-only checkpoint the top layers are specialised for the pretraining task and
@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
+from transformers import AutoModel, Wav2Vec2FeatureExtractor
 
 from pinyin_units import HEADS, VOCABS
 
@@ -22,6 +22,7 @@ class PinyinCTC(nn.Module):
     def __init__(self, encoder, dropout=0.1, per_head_mix=False):
         super().__init__()
         self.encoder = encoder
+        self.encoder_frozen = False     # set by freeze_encoder()
         hidden = encoder.config.hidden_size
         n_layers = encoder.config.num_hidden_layers + 1          # + the input to layer 1
         # One mix shared by the three heads (shape: layers), or one mix for each head
@@ -39,7 +40,7 @@ class PinyinCTC(nn.Module):
     def from_encoder(cls, name=DEFAULT_ENCODER, mask_time_prob=0.05, dropout=0.1,
                      per_head_mix=False):
         """Fresh model: pretrained encoder + untrained layer mix and heads."""
-        encoder = Wav2Vec2Model.from_pretrained(
+        encoder = AutoModel.from_pretrained(     # picks wav2vec2 or HuBERT from the checkpoint
             name,
             apply_spec_augment=True,
             mask_time_prob=mask_time_prob,   # the checkpoint's own value is for pretraining
@@ -59,7 +60,7 @@ class PinyinCTC(nn.Module):
         training moves the copies apart."""
         model_dir = Path(model_dir)
         kwargs = {} if mask_time_prob is None else {"mask_time_prob": mask_time_prob}
-        encoder = Wav2Vec2Model.from_pretrained(model_dir / "encoder", **kwargs)
+        encoder = AutoModel.from_pretrained(model_dir / "encoder", **kwargs)
         top = model_dir / "top.pt"
         if not top.exists():
             raise FileNotFoundError(f"{top} not found; this model was saved by an older version "
@@ -85,6 +86,26 @@ class PinyinCTC(nn.Module):
         if feature_extractor is not None:
             feature_extractor.save_pretrained(model_dir / "encoder")
 
+    def freeze_front_end(self):
+        """The convolutional front end (raw audio -> frames) always stays fixed."""
+        if hasattr(self.encoder, "freeze_feature_encoder"):
+            self.encoder.freeze_feature_encoder()
+        else:                                   # HuBERT in some transformers versions
+            self.encoder.feature_extractor._freeze_parameters()
+
+    def freeze_encoder(self):
+        """Keep the whole encoder exactly as it is; only the layer mix and heads will learn.
+        Used to compare encoders cheaply: whichever gives the best result while frozen
+        already holds the most useful information."""
+        self.encoder.requires_grad_(False)
+        self.encoder_frozen = True
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.encoder_frozen:
+            self.encoder.eval()     # no dropout or masking inside a frozen encoder
+        return self
+
     def top_parameters(self):
         """Everything trained from scratch: layer mix, norm and heads."""
         return [p for n, p in self.named_parameters() if not n.startswith("encoder.")]
@@ -104,8 +125,9 @@ class PinyinCTC(nn.Module):
         return self.encoder._get_feat_extract_output_lengths(sample_lengths)
 
     def forward(self, input_values, attention_mask=None):
-        out = self.encoder(input_values, attention_mask=attention_mask,
-                           output_hidden_states=True)
+        with torch.set_grad_enabled(not self.encoder_frozen and torch.is_grad_enabled()):
+            out = self.encoder(input_values, attention_mask=attention_mask,
+                               output_hidden_states=True)
         layers = torch.stack(out.hidden_states, dim=0)                # (L, B, T, D)
         weights = F.softmax(self.layer_weights, dim=-1).to(layers.dtype)
         if not self.per_head_mix:

@@ -15,6 +15,7 @@ Evaluate only:
 import argparse
 import json
 import math
+import random
 from pathlib import Path
 
 import torch
@@ -35,8 +36,22 @@ def edit_distance(a, b):
     return prev[-1]
 
 
-def make_loader(rows, collator, args, shuffle, augment=False, voice_augment=False):
-    sampler = DurationBatchSampler(rows, args.batch_seconds, args.max_batch_size, shuffle, args.seed)
+def sample_hours(rows, hours, seed):
+    """A random selection of clips adding up to about `hours` of audio."""
+    rows = list(rows)
+    random.Random(seed).shuffle(rows)
+    picked, seconds = [], 0.0
+    for row in rows:
+        if seconds >= hours * 3600:
+            break
+        picked.append(row)
+        seconds += row["duration"]
+    return picked
+
+
+def make_loader(rows, collator, args, shuffle, augment=False, voice_augment=False, seed=None):
+    seed = args.seed if seed is None else seed
+    sampler = DurationBatchSampler(rows, args.batch_seconds, args.max_batch_size, shuffle, seed)
     return DataLoader(ClipDataset(rows, augment=augment, voice_augment=voice_augment),
                       batch_sampler=sampler, collate_fn=collator, num_workers=args.workers)
 
@@ -115,6 +130,13 @@ def main():
                         "single-syllable training clips, so few speakers sound like many")
     p.add_argument("--per-head-mix", action="store_true",
                    help="give each head its own mix of the encoder's layers instead of one shared mix")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="train only the layer mix and the heads; the encoder stays as it is")
+    p.add_argument("--sentences", nargs="+", default=[],
+                   help="sentence manifests (AISHELL) to mix in alongside --train, so the encoder "
+                        "keeps hearing many speakers while it learns single syllables")
+    p.add_argument("--sentence-hours", type=float, default=3.0,
+                   help="hours of --sentences audio used per epoch; a new random selection each epoch")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -131,7 +153,9 @@ def main():
         model = PinyinCTC.from_encoder(args.encoder, mask_time_prob=args.mask_time_prob,
                                        per_head_mix=args.per_head_mix)
         feature_extractor = PinyinCTC.load_feature_extractor(args.encoder)
-    model.encoder.freeze_feature_encoder()   # the convolutional front end stays fixed
+    model.freeze_front_end()   # the convolutional front end stays fixed
+    if args.freeze_encoder:
+        model.freeze_encoder()
     model.to(device)
 
     collator = Collator(feature_extractor)
@@ -144,18 +168,31 @@ def main():
         raise SystemExit("--train is required unless --eval-only is set")
 
     train_rows = read_manifests(args.train)
-    train_loader = make_loader(train_rows, collator, args, shuffle=True, augment=args.augment,
-                               voice_augment=args.voice_augment)
+    sentence_rows = read_manifests(args.sentences) if args.sentences else []
+
+    def epoch_loader(epoch):
+        """Every epoch uses all of --train plus a fresh selection of sentences."""
+        rows = train_rows + sample_hours(sentence_rows, args.sentence_hours, args.seed + epoch)
+        return make_loader(rows, collator, args, shuffle=True, augment=args.augment,
+                           voice_augment=args.voice_augment, seed=args.seed + epoch)
+
+    train_loader = epoch_loader(1)
     hours = sum(r["duration"] for r in train_rows) / 3600
     print(f"{len(train_rows)} training clips, {hours:.1f} hours, "
-          f"{len(train_loader)} batches per epoch, device={device}, amp={use_amp}")
+          f"{len(train_loader)} batches per epoch, device={device}, amp={use_amp}", flush=True)
+    if sentence_rows:
+        print(f"plus {args.sentence_hours:.1f} hours per epoch drawn from "
+              f"{len(sentence_rows)} sentence clips", flush=True)
 
     encoder_params = [q for q in model.encoder.parameters() if q.requires_grad]
     head_params = model.top_parameters()
     params = encoder_params + head_params
-    optimizer = torch.optim.AdamW(
-        [{"params": encoder_params, "lr": args.lr},
-         {"params": head_params, "lr": args.head_lr}], weight_decay=0.01)
+    groups = [{"params": head_params, "lr": args.head_lr}]
+    if encoder_params:                       # empty when --freeze-encoder is set
+        groups.insert(0, {"params": encoder_params, "lr": args.lr})
+    print(f"training {sum(q.numel() for q in params) / 1e6:.2f}M parameters"
+          + (" (encoder frozen)" if args.freeze_encoder else ""), flush=True)
+    optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
 
     # Warm up, hold at full rate until halfway, then decay linearly to 5%.
     total_steps = math.ceil(len(train_loader) / args.grad_accum) * args.epochs
@@ -180,6 +217,8 @@ def main():
     best, step = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if sentence_rows and epoch > 1:
+            train_loader = epoch_loader(epoch)
         recent = {h: 0.0 for h in HEADS}   # loss over the last 50 batches only
         optimizer.zero_grad()
         for i, batch in enumerate(train_loader, 1):

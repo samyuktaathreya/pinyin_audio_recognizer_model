@@ -23,6 +23,13 @@ from model import PinyinCTC
 from pinyin_units import HEADS, VOCABS, display, split_syllable
 
 
+# A part is flagged as wrong only when the target's probability falls below this.
+# Measured on native speech (stage 6b, voices it never trained on): at 0.5 about 18% of
+# correct syllables were wrongly flagged, at 0.05 about 7.5%, while swapped-target errors
+# on easily confused pairs slipped through 1 to 3% of the time.
+DEFAULT_THRESHOLD = 0.05
+
+
 def single_unit_scores(log_probs):
     """log_probs: (T, C) with blank at 0.
 
@@ -48,8 +55,12 @@ class Scorer:
         self.fe = PinyinCTC.load_feature_extractor(model_dir)
 
     @torch.no_grad()
-    def score(self, audio, target, threshold=0.5, top_k=3):
-        """audio: a file path, or a mono float32 numpy array at 16 kHz."""
+    def score(self, audio, target, threshold=DEFAULT_THRESHOLD, top_k=3):
+        """audio: a file path, or a mono float32 numpy array at 16 kHz.
+
+        A part counts as correct unless the model gives the target less than `threshold`
+        probability. "heard" is still the model's top guess, so it can differ from the
+        target on a part that is marked correct; that means "close enough"."""
         parts = split_syllable(target)
         if parts is None:
             raise ValueError(f"not a pinyin syllable with tone: {target!r}")
@@ -75,7 +86,7 @@ class Scorer:
                 "target_unit": want,
                 "heard_unit": heard,
                 "score": round(score, 4),
-                "correct": heard == want and score >= threshold,
+                "correct": score >= threshold,
                 "top": [(display(head, u), round(pr, 4)) for u, pr in ranked[:top_k]],
             }
         result["no_speech"] = min(silence_probs) > 0.5
@@ -89,7 +100,7 @@ def main():
     p.add_argument("--model", required=True)
     p.add_argument("--audio", required=True)
     p.add_argument("--target", required=True, help="e.g. zhuang4, lv4, yi1")
-    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     args = p.parse_args()
     result = Scorer(args.model).score(args.audio, args.target, args.threshold)
     print(json.dumps(result, ensure_ascii=False, indent=2))
