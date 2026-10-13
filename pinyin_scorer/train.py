@@ -128,6 +128,10 @@ def main():
     p.add_argument("--voice-augment", action="store_true",
                    help="randomly shift the voice (up to 2 semitones) and the speaking speed of "
                         "single-syllable training clips, so few speakers sound like many")
+    p.add_argument("--praat-augment", action="store_true",
+                   help="like --voice-augment, but shifts vowel resonances (x0.88-1.13) and pitch "
+                        "(+-4 semitones) separately, with Praat; needs praat-parselmouth. "
+                        "Use instead of --voice-augment, not with it")
     p.add_argument("--per-head-mix", action="store_true",
                    help="give each head its own mix of the encoder's layers instead of one shared mix")
     p.add_argument("--freeze-encoder", action="store_true",
@@ -140,6 +144,11 @@ def main():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+    if args.praat_augment and args.voice_augment:
+        raise SystemExit("use --praat-augment or --voice-augment, not both")
+    voice_mode = "praat" if args.praat_augment else args.voice_augment
+    if voice_mode == "praat":
+        import parselmouth  # noqa: F401  fail now, not inside a data-loader worker
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,12 +183,13 @@ def main():
         """Every epoch uses all of --train plus a fresh selection of sentences."""
         rows = train_rows + sample_hours(sentence_rows, args.sentence_hours, args.seed + epoch)
         return make_loader(rows, collator, args, shuffle=True, augment=args.augment,
-                           voice_augment=args.voice_augment, seed=args.seed + epoch)
+                           voice_augment=voice_mode, seed=args.seed + epoch)
 
     train_loader = epoch_loader(1)
     hours = sum(r["duration"] for r in train_rows) / 3600
     print(f"{len(train_rows)} training clips, {hours:.1f} hours, "
-          f"{len(train_loader)} batches per epoch, device={device}, amp={use_amp}", flush=True)
+          f"{len(train_loader)} batches per epoch, device={device}, amp={use_amp}, "
+          f"voice augmentation={voice_mode or 'off'}", flush=True)
     if sentence_rows:
         print(f"plus {args.sentence_hours:.1f} hours per epoch drawn from "
               f"{len(sentence_rows)} sentence clips", flush=True)

@@ -6,6 +6,7 @@ Sentences and single syllables use the same format (a syllable is a sentence of 
 """
 import json
 import random
+import warnings
 from math import gcd
 
 import numpy as np
@@ -136,8 +137,55 @@ def change_voice(wav, rng):
     return pad_audio(normalize_loudness(wav.astype(np.float32)))
 
 
+FORMANT_RANGE = (0.88, 1.13)   # vowel resonances scaled by a factor in this range (log-uniform)
+PITCH_SEMITONES = 4.0          # pitch moved up or down by up to this, independently of resonances
+
+
+def praat_voice(wav, rng):
+    """Make one speaker sound like a different one by changing vowel resonances and pitch
+    SEPARATELY, plus the speaking speed.
+
+    Real speakers differ in vocal-tract size (resonances) and in pitch independently. The
+    shift test showed the model is thrown both by resonances moving about 10% and by the
+    pitch moving down with the resonances unchanged, so this covers both, in any
+    combination:
+      resonances: x0.88 to x1.13 (log-uniform), the spread between adult speakers
+      pitch:      up to 4 semitones up or down; the SHAPE of the contour is kept, so the
+                  tone label stays right
+      tempo:      15% slower to 20% faster, at the same pitch
+
+    Uses Praat's "Change gender" (parselmouth). Pitch is tracked in a range around the
+    clip's own median, because a wide fixed range (75-600 Hz) produced octave errors that
+    the resynthesis then baked into the contour. If no pitch is found, only resonances and
+    tempo change. If Praat fails, the clip is returned unchanged."""
+    import parselmouth                      # imported here so scoring and the app don't need it
+    from parselmouth.praat import call
+
+    formant = float(np.exp(rng.uniform(np.log(FORMANT_RANGE[0]), np.log(FORMANT_RANGE[1]))))
+    semitones = rng.uniform(-PITCH_SEMITONES, PITCH_SEMITONES)
+    duration = 1.0 / rng.uniform(*TEMPO_RANGE)
+    try:
+        snd = parselmouth.Sound(wav.astype(np.float64), sampling_frequency=SAMPLE_RATE)
+        median = call(snd.to_pitch(pitch_floor=75.0, pitch_ceiling=600.0),
+                      "Get quantile", 0, 0, 0.5, "Hertz")
+        if median is None or not np.isfinite(median):
+            floor, ceiling, new_median = 75.0, 600.0, 0.0      # 0 = keep pitch as it is
+        else:
+            floor, ceiling = max(60.0, median / 2), min(800.0, median * 2)
+            new_median = median * 2 ** (semitones / 12)
+        with warnings.catch_warnings():            # "no voiced segments" etc. would flood the log
+            warnings.simplefilter("ignore")
+            out = call(snd, "Change gender", floor, ceiling, formant, new_median, 1.0, duration)
+        wav = np.asarray(out.values[0], dtype=np.float32)
+    except Exception:
+        return wav
+    return pad_audio(normalize_loudness(wav))
+
+
 class ClipDataset(Dataset):
     def __init__(self, rows, augment=False, voice_augment=False):
+        """voice_augment: False, True or "librosa" (change_voice: pitch and resonances
+        together), or "praat" (praat_voice: resonances and pitch separately)."""
         self.rows = rows
         self.augment = augment
         self.voice_augment = voice_augment
@@ -152,7 +200,7 @@ class ClipDataset(Dataset):
         rng = np.random.default_rng(torch.randint(0, 2**31, (1,)).item())
         # Only single syllables: sentences already come from hundreds of speakers.
         if self.voice_augment and len(row["labels"]["tone"]) == 1 and rng.random() < 0.8:
-            wav = change_voice(wav, rng)
+            wav = praat_voice(wav, rng) if self.voice_augment == "praat" else change_voice(wav, rng)
         if self.augment and row.get("augment", True):
             wav = augment_audio(wav, rng)
         return {"wav": wav, "labels": row["labels"]}
