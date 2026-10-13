@@ -26,7 +26,6 @@ import collections
 import csv
 import json
 import math
-import sys
 from multiprocessing import Pool
 
 import numpy as np
@@ -46,40 +45,6 @@ CONDITIONS = [  # name, formant ratio, pitch shift in semitones (None = untouche
 
 DEFAULT_FINALS = ["an", "ang", "en", "eng", "in", "ing", "ong", "ian", "iang",
                   "uan", "uang", "ueng", "iong", "ao", "ou"]
-
-# ---------------------------------------------------------------- pinyin -> parts
-# Same conventions as pinyin_units.py (v for ü, ii, iii, y/w forms undone).
-# --check and the run itself verify every target against the model's vocabulary.
-INITIALS = ["zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l",
-            "g", "k", "h", "j", "q", "x", "r", "z", "c", "s"]
-Y_MAP = {"yi": "i", "ya": "ia", "ye": "ie", "yao": "iao", "you": "iu", "yan": "ian",
-         "yin": "in", "yang": "iang", "ying": "ing", "yong": "iong", "yu": "v",
-         "yue": "ve", "yuan": "van", "yun": "vn", "yo": "io"}
-W_MAP = {"wu": "u", "wa": "ua", "wo": "uo", "wai": "uai", "wei": "ui", "wan": "uan",
-         "wen": "un", "wang": "uang", "weng": "ueng"}
-
-
-def split_pinyin(p):
-    p = p.strip().lower().replace("ü", "v").replace("u:", "v")
-    tone = p[-1] if p[-1].isdigit() else "5"
-    tone = "5" if tone == "0" else tone
-    base = p.rstrip("012345")
-    if base in Y_MAP:
-        return "_", Y_MAP[base], tone
-    if base in W_MAP:
-        return "_", W_MAP[base], tone
-    for ini in INITIALS:
-        if base.startswith(ini) and len(base) > len(ini):
-            fin = base[len(ini):]
-            if ini in ("zh", "ch", "sh", "r") and fin == "i":
-                fin = "iii"
-            elif ini in ("z", "c", "s") and fin == "i":
-                fin = "ii"
-            elif ini in ("j", "q", "x") and fin.startswith("u"):
-                fin = "v" + fin[1:]
-            return ini, fin, tone
-    return "_", base, tone
-
 
 # ---------------------------------------------------------------- audio (workers)
 def _worker_init():
@@ -115,37 +80,28 @@ def make_versions(item):
     return rec, out
 
 
-# ---------------------------------------------------------------- scoring adapter
-def _find_dist(obj):
-    """Find a {unit: probability} mapping inside one part of score()'s result."""
-    if isinstance(obj, dict):
-        if obj and all(isinstance(v, (int, float)) for v in obj.values()):
-            return obj
-        for k in ("probs", "probabilities", "distribution", "dist", "all"):
-            if k in obj:
-                return _find_dist(obj[k])
-    for k in ("probs", "probabilities", "distribution", "dist"):
-        if hasattr(obj, k):
-            return _find_dist(getattr(obj, k))
-    return None
-
-
+# ---------------------------------------------------------------- scoring
 def get_probs(scorer, wav, syllable):
-    """{part: {unit: probability}} for one clip, from Scorer.score()."""
-    res = scorer.score(wav, syllable)
+    """{part: {unit: probability}} for one clip: the same numbers Scorer.score() uses
+    (one-unit CTC paths plus silence, normalised together), but for every unit."""
+    import torch
+    import torch.nn.functional as F
+    from data import SAMPLE_RATE, normalize_loudness, pad_audio
+    from pinyin_units import HEADS, VOCABS
+    from score import single_unit_scores
+
+    wav = pad_audio(normalize_loudness(np.asarray(wav, dtype=np.float32)))
+    feats = scorer.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+    with torch.no_grad():
+        logits = scorer.model(feats["input_values"].to(scorer.device))
     out = {}
-    for part in PARTS:
-        obj = res.get(part) if isinstance(res, dict) else getattr(res, part, None)
-        d = _find_dist(obj) if obj is not None else None
-        if d is None:
-            sys.exit("Couldn't find the full probability list in Scorer.score()'s result.\n"
-                     f"It looks like this:\n{repr(res)[:2000]}\n"
-                     "Paste score.py and get_probs() can be fitted to it.")
-        d = {str(k).split(":")[-1]: float(v) for k, v in d.items()}
-        if any(v < 0 for v in d.values()):  # log-probabilities
-            d = {k: math.exp(v) for k, v in d.items()}
-        total = sum(d.values()) or 1.0
-        out[part] = {k: v / total for k, v in d.items()}
+    for head in HEADS:
+        log_probs = F.log_softmax(logits[head][0].float(), dim=-1).cpu()
+        scores, silence = single_unit_scores(log_probs)
+        probs = torch.softmax(torch.cat([scores, silence.view(1)]), dim=0).tolist()
+        d = dict(zip(VOCABS[head][1:], probs[:-1]))
+        d["<silence>"] = probs[-1]
+        out[head] = d
     return out
 
 
@@ -177,6 +133,8 @@ def main():
     ap.add_argument("--check", action="store_true", help="3 clips only, print what's found")
     args = ap.parse_args()
 
+    from pinyin_units import HEADS, split_syllable
+    assert tuple(HEADS) == PARTS, f"unexpected heads {HEADS}"
     conds = [c for c in CONDITIONS if not args.conditions or c[0] in args.conditions]
     finals = set(args.finals)
 
@@ -187,7 +145,10 @@ def main():
             rec["source"] = rec.get("source") or rec.get("speaker") or "?"
             if args.sources and rec["source"] not in args.sources:
                 continue
-            rec["parts"] = dict(zip(PARTS, split_pinyin(rec["pinyin"])))
+            parts = split_syllable(rec["pinyin"])
+            if parts is None:
+                continue
+            rec["parts"] = dict(zip(PARTS, parts))
             if rec["parts"]["final"] in finals:
                 items.append((rec, conds))
     if args.check:
