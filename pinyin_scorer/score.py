@@ -31,11 +31,19 @@ DEFAULT_THRESHOLD = 0.05
 
 # Answers accepted in place of the target, per head. The partner's probability is added to the
 # target's before the threshold is applied, so a clip heard as the partner still counts as correct.
-# One-directional: {"eng": ("ang",)} forgives eng heard as ang, but ang heard as eng is still flagged.
+# One-directional unless listed both ways: eng accepts ang, but ang does not accept eng.
 # eng/ang: the model can't reliably tell an open eng from ang on unfamiliar voices (Oct 2026), and
 # borderline eng is often accepted by native listeners when the intended word is known.
+# n/ng swaps (product decision): an<->ang, en<->eng, in<->ing, ian<->iang, uan<->uang.
+# Vowel swaps (one-directional): eng heard as ang, en heard as an.
 FORGIVE = {
-    "final": {"eng": ("ang",)},
+    "final": {
+        "an": ("ang",), "ang": ("an",),
+        "en": ("eng", "an"), "eng": ("en", "ang"),
+        "in": ("ing",), "ing": ("in",),
+        "ian": ("iang",), "iang": ("ian",),
+        "uan": ("uang",), "uang": ("uan",),
+    },
 }
 
 
