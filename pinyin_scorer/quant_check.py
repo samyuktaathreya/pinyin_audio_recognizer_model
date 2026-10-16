@@ -1,5 +1,7 @@
 """Measure the scorer the way the 2 GB server would run it: CPU only, fixed threads, optionally 8-bit.
 
+With --onnx it uses onnx_scorer.py instead (what the server runs; PyTorch is never imported).
+
 Run as its own process so the memory figures are clean (not mixed with the notebook's own models):
     !python quant_check.py --models {runs}/stage6b/best {runs}/stage7_hubert/best \
         --pitch {runs}/tone23_pitch.joblib --quantize --threads 2 --n 600 --out {runs}/quant_int8.pkl
@@ -28,20 +30,28 @@ def main():
     ap.add_argument("--manifests", nargs="+", default=[
         "manifests/syl_test.jsonl", "manifests/good/test_studycli.jsonl", "manifests/good/test_uvm.jsonl"])
     ap.add_argument("--quantize", action="store_true")
+    ap.add_argument("--onnx", action="store_true", help="--models are ONNX folders from export_onnx.py (no PyTorch)")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--n", type=int, default=600, help="random test clips to score")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     print(f"python + nothing loaded: {rss_mb():.0f} MB")
-    import torch
-    from score import Scorer
-    print(f"after importing torch/transformers: {rss_mb():.0f} MB")
-    t0 = time.time()
-    scorer = Scorer(args.models, device="cpu", pitch_model=args.pitch,
-                    quantize=args.quantize, threads=args.threads)
-    print(f"models loaded ({'8-bit' if args.quantize else 'full precision'}, {args.threads} threads) "
-          f"in {time.time() - t0:.0f} s: {rss_mb():.0f} MB now")
+    if args.onnx:
+        from onnx_scorer import OnnxScorer as Scorer
+        print(f"after importing onnxruntime + scoring code: {rss_mb():.0f} MB")
+        t0 = time.time()
+        scorer = Scorer(args.models, pitch_model=args.pitch, threads=args.threads)
+        kind = "8-bit ONNX"
+    else:
+        import torch  # noqa: F401
+        from score import Scorer
+        print(f"after importing torch/transformers: {rss_mb():.0f} MB")
+        t0 = time.time()
+        scorer = Scorer(args.models, device="cpu", pitch_model=args.pitch,
+                        quantize=args.quantize, threads=args.threads)
+        kind = "8-bit PyTorch" if args.quantize else "full precision PyTorch"
+    print(f"models loaded ({kind}, {args.threads} threads) in {time.time() - t0:.0f} s: {rss_mb():.0f} MB now")
 
     clips = []
     for m in args.manifests:

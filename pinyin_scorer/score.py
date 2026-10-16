@@ -18,7 +18,6 @@ the pitch contour re-splits the tone 2 vs tone 3 probability (see PITCH_WEIGHT).
 """
 import argparse
 import json
-import math
 
 import numpy as np
 import torch
@@ -29,33 +28,10 @@ from model import PinyinCTC
 from pinyin_units import HEADS, VOCABS, display, split_syllable
 
 
-# A part is flagged as wrong only when the target's probability falls below this.
-# Measured on native speech (stage 6b, voices it never trained on): at 0.5 about 18% of
-# correct syllables were wrongly flagged, at 0.05 about 7.5%, while swapped-target errors
-# on easily confused pairs slipped through 1 to 3% of the time.
-DEFAULT_THRESHOLD = 0.05
-
-# Answers accepted in place of the target, per head. The partner's probability is added to the
-# target's before the threshold is applied, so a clip heard as the partner still counts as correct.
-# One-directional unless listed both ways: eng accepts ang, but ang does not accept eng.
-# eng/ang: the model can't reliably tell an open eng from ang on unfamiliar voices (Oct 2026), and
-# borderline eng is often accepted by native listeners when the intended word is known.
-# n/ng swaps (product decision): an<->ang, en<->eng, in<->ing, ian<->iang, uan<->uang.
-# Vowel swaps (one-directional): eng heard as ang, en heard as an.
-FORGIVE = {
-    "final": {
-        "an": ("ang",), "ang": ("an",),
-        "en": ("eng", "an"), "eng": ("en", "ang"),
-        "in": ("ing",), "ing": ("in",),
-        "ian": ("iang",), "iang": ("ian",),
-        "uan": ("uang",), "uang": ("uan",),
-    },
-}
-
-# How much the pitch contour counts when re-splitting tone 2 vs 3 (0 = model only, 1 = pitch only).
-# 0.3 measured Oct 2026 (6b+7, web voices): false alarms 3.3% -> 1.9%, all-3 accuracy 90.3% -> 91.6%,
-# while native tone 3 accepted as an attempt at tone 2 rose 6.9% -> 8.8%. Above 0.3 that cost rises fast.
-PITCH_WEIGHT = 0.3
+# Rules, thresholds and the decision functions live in scorer_core.py (no PyTorch), shared with
+# the ONNX server. Re-exported here so `from score import FORGIVE, judge, ...` keeps working.
+from scorer_core import (DEFAULT_THRESHOLD, FORGIVE, PITCH_WEIGHT, apply_pitch, combine,  # noqa: F401
+                         credited, judge)
 
 
 def single_unit_scores(log_probs):
@@ -74,66 +50,6 @@ def single_unit_scores(log_probs):
         before = before + blank[t]
         inside, after = new_inside, new_after
     return torch.logaddexp(inside, after), before
-
-
-# ---------------------------------------------------------------- pure functions (no torch), also used
-# by the evaluation notebook so it measures exactly what the app does.
-# A "probs" object is {head: {unit: probability, ..., "<silence>": probability}}.
-
-def combine(prob_list):
-    """Average several models' probs."""
-    return {h: {u: sum(p[h][u] for p in prob_list) / len(prob_list) for u in prob_list[0][h]}
-            for h in prob_list[0]}
-
-
-def apply_pitch(probs, vote, weight=PITCH_WEIGHT):
-    """Re-split the tone 2 + tone 3 probability using the pitch vote (log-odds of 2 over 3).
-    Their total, and every other tone, stays as the model gave it."""
-    if vote is None or weight <= 0:
-        return probs
-    tone = dict(probs["tone"])
-    m2, m3 = tone["2"], tone["3"]
-    lm = math.log(m2 + 1e-9) - math.log(m3 + 1e-9)
-    z = (1 - weight) * lm + weight * vote
-    q = 1 / (1 + math.exp(-max(-50.0, min(50.0, z))))
-    tone["2"], tone["3"] = (m2 + m3) * q, (m2 + m3) * (1 - q)
-    return {**probs, "tone": tone}
-
-
-def credited(probs, head, unit, forgive=FORGIVE):
-    """Probability counted for `unit`: its own plus that of any forgiven partner."""
-    d = probs[head]
-    return d[unit] + sum(d[u] for u in forgive.get(head, {}).get(unit, ()))
-
-
-def judge(probs, target, threshold=DEFAULT_THRESHOLD, top_k=3, forgive=FORGIVE):
-    """The result dict the app receives, from (combined) probs."""
-    parts = split_syllable(target)
-    if parts is None:
-        raise ValueError(f"not a pinyin syllable with tone: {target!r}")
-    result = {"target": target, "parts": {}}
-    silence_probs = []
-    for head, want in zip(HEADS, parts):
-        d = probs[head]
-        silence_probs.append(d["<silence>"])
-        ranked = sorted(((u, d[u]) for u in VOCABS[head][1:]), key=lambda x: -x[1])
-        forgiven = forgive.get(head, {}).get(want, ())
-        score = credited(probs, head, want, forgive)
-        heard = ranked[0][0]
-        result["parts"][head] = {
-            "target": display(head, want),
-            "heard": display(head, heard),
-            "target_unit": want,
-            "heard_unit": heard,
-            "score": round(score, 4),
-            "correct": score >= threshold,
-            "forgiven": heard in forgiven,   # top guess was an accepted partner, e.g. ang for eng
-            "top": [(display(head, u), round(pr, 4)) for u, pr in ranked[:top_k]],
-        }
-    result["no_speech"] = min(silence_probs) > 0.5
-    result["understood"] = (not result["no_speech"]
-                            and all(p["correct"] for p in result["parts"].values()))
-    return result
 
 
 # ---------------------------------------------------------------- the scorer

@@ -1,6 +1,13 @@
-torch>=2.3
-transformers>=4.40
-pypinyin>=0.50
-soundfile>=0.12
-scipy
+# Inference server for pinyin_scorer: ONNX models, no PyTorch.
+# Pin scikit-learn to the version tone23_pitch.joblib was saved with (in Colab: !pip show scikit-learn).
+onnxruntime
 numpy
+scipy
+soundfile
+praat-parselmouth
+scikit-learn
+joblib
+pypinyin            # only if pinyin_units.py imports it at the top
+fastapi
+uvicorn[standard]
+python-multipart

@@ -6,9 +6,9 @@
 Run locally:
     MODEL_DIR=./models uvicorn server:app --host 0.0.0.0 --port 8000
 
-MODEL_DIR must contain:
-    stage6b/        (the contents of stage6b/best:  encoder/, top.pt, units.json)
-    stage7_hubert/  (the contents of stage7_hubert/best)
+MODEL_DIR must contain (8-bit ONNX models from export_onnx.py; no PyTorch needed):
+    stage6b/          model_int8.onnx, onnx.json
+    stage7_hubert/    model_int8.onnx, onnx.json
     tone23_pitch.joblib
 
 The browser can send whatever MediaRecorder produces (webm/opus, ogg, mp4/aac) or a wav file;
@@ -22,12 +22,11 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+from onnx_scorer import OnnxScorer
 from pinyin_units import split_syllable
-from score import Scorer
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
-QUANTIZE = os.environ.get("QUANTIZE", "1") == "1"          # 8-bit models: needed on a 2 GB server
-THREADS = int(os.environ.get("THREADS", "0")) or None      # CPU threads for PyTorch
+THREADS = int(os.environ.get("THREADS", "0")) or None      # CPU threads (set to the server's core count)
 MAX_BYTES = 2_000_000          # ~2 MB upload limit
 MAX_SECONDS = 4.0              # a single syllable; longer audio is rejected
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
@@ -36,9 +35,8 @@ app = FastAPI(title="pinyin scorer")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["POST", "GET"],
                    allow_headers=["*"])
 
-scorer = Scorer([os.path.join(MODEL_DIR, "stage6b"), os.path.join(MODEL_DIR, "stage7_hubert")],
-                pitch_model=os.path.join(MODEL_DIR, "tone23_pitch.joblib"),
-                quantize=QUANTIZE, threads=THREADS)
+scorer = OnnxScorer([os.path.join(MODEL_DIR, "stage6b"), os.path.join(MODEL_DIR, "stage7_hubert")],
+                    pitch_model=os.path.join(MODEL_DIR, "tone23_pitch.joblib"), threads=THREADS)
 
 
 def decode(data: bytes) -> np.ndarray:
