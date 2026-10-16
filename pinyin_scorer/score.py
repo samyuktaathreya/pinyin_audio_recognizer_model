@@ -5,14 +5,20 @@ spoken, how likely is each candidate? That gives a score for the target and, whe
 target loses, what was heard instead.
 
 Command line:
-    python score.py --model runs/stage2/best --audio attempt.wav --target zhuang4
+    python score.py --model runs/stage6b/best runs/stage7_hubert/best \
+        --pitch-model runs/tone23_pitch.joblib --audio attempt.wav --target zhuang4
 
 In a server, load once and reuse:
-    scorer = Scorer("runs/stage2/best")
+    scorer = Scorer(["runs/stage6b/best", "runs/stage7_hubert/best"],
+                    pitch_model="runs/tone23_pitch.joblib")
     result = scorer.score("attempt.wav", "zhuang4")
+
+Several model folders are combined by averaging their probabilities per part. With a pitch model,
+the pitch contour re-splits the tone 2 vs tone 3 probability (see PITCH_WEIGHT).
 """
 import argparse
 import json
+import math
 
 import numpy as np
 import torch
@@ -46,6 +52,11 @@ FORGIVE = {
     },
 }
 
+# How much the pitch contour counts when re-splitting tone 2 vs 3 (0 = model only, 1 = pitch only).
+# 0.3 measured Oct 2026 (6b+7, web voices): false alarms 3.3% -> 1.9%, all-3 accuracy 90.3% -> 91.6%,
+# while native tone 3 accepted as an attempt at tone 2 rose 6.9% -> 8.8%. Above 0.3 that cost rises fast.
+PITCH_WEIGHT = 0.3
+
 
 def single_unit_scores(log_probs):
     """log_probs: (T, C) with blank at 0.
@@ -65,64 +76,129 @@ def single_unit_scores(log_probs):
     return torch.logaddexp(inside, after), before
 
 
+# ---------------------------------------------------------------- pure functions (no torch), also used
+# by the evaluation notebook so it measures exactly what the app does.
+# A "probs" object is {head: {unit: probability, ..., "<silence>": probability}}.
+
+def combine(prob_list):
+    """Average several models' probs."""
+    return {h: {u: sum(p[h][u] for p in prob_list) / len(prob_list) for u in prob_list[0][h]}
+            for h in prob_list[0]}
+
+
+def apply_pitch(probs, vote, weight=PITCH_WEIGHT):
+    """Re-split the tone 2 + tone 3 probability using the pitch vote (log-odds of 2 over 3).
+    Their total, and every other tone, stays as the model gave it."""
+    if vote is None or weight <= 0:
+        return probs
+    tone = dict(probs["tone"])
+    m2, m3 = tone["2"], tone["3"]
+    lm = math.log(m2 + 1e-9) - math.log(m3 + 1e-9)
+    z = (1 - weight) * lm + weight * vote
+    q = 1 / (1 + math.exp(-max(-50.0, min(50.0, z))))
+    tone["2"], tone["3"] = (m2 + m3) * q, (m2 + m3) * (1 - q)
+    return {**probs, "tone": tone}
+
+
+def credited(probs, head, unit, forgive=FORGIVE):
+    """Probability counted for `unit`: its own plus that of any forgiven partner."""
+    d = probs[head]
+    return d[unit] + sum(d[u] for u in forgive.get(head, {}).get(unit, ()))
+
+
+def judge(probs, target, threshold=DEFAULT_THRESHOLD, top_k=3, forgive=FORGIVE):
+    """The result dict the app receives, from (combined) probs."""
+    parts = split_syllable(target)
+    if parts is None:
+        raise ValueError(f"not a pinyin syllable with tone: {target!r}")
+    result = {"target": target, "parts": {}}
+    silence_probs = []
+    for head, want in zip(HEADS, parts):
+        d = probs[head]
+        silence_probs.append(d["<silence>"])
+        ranked = sorted(((u, d[u]) for u in VOCABS[head][1:]), key=lambda x: -x[1])
+        forgiven = forgive.get(head, {}).get(want, ())
+        score = credited(probs, head, want, forgive)
+        heard = ranked[0][0]
+        result["parts"][head] = {
+            "target": display(head, want),
+            "heard": display(head, heard),
+            "target_unit": want,
+            "heard_unit": heard,
+            "score": round(score, 4),
+            "correct": score >= threshold,
+            "forgiven": heard in forgiven,   # top guess was an accepted partner, e.g. ang for eng
+            "top": [(display(head, u), round(pr, 4)) for u, pr in ranked[:top_k]],
+        }
+    result["no_speech"] = min(silence_probs) > 0.5
+    result["understood"] = (not result["no_speech"]
+                            and all(p["correct"] for p in result["parts"].values()))
+    return result
+
+
+# ---------------------------------------------------------------- the scorer
 class Scorer:
-    def __init__(self, model_dir, device=None):
+    def __init__(self, model_dirs, device=None, pitch_model=None, pitch_weight=PITCH_WEIGHT):
+        """model_dirs: one model folder or a list of them (probabilities are averaged).
+        pitch_model: path to the saved tone 2/3 pitch classifier, or None to skip it."""
+        if isinstance(model_dirs, str):
+            model_dirs = [model_dirs]
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.model = PinyinCTC.load(model_dir).to(self.device).eval()
-        self.fe = PinyinCTC.load_feature_extractor(model_dir)
+        self.models = [(PinyinCTC.load(m).to(self.device).eval(), PinyinCTC.load_feature_extractor(m))
+                       for m in model_dirs]
+        self.model, self.fe = self.models[0]      # for older scripts that use these directly
+        self.pitch = None
+        if pitch_model:
+            from pitch_tone import PitchTone
+            self.pitch = PitchTone(pitch_model)
+        self.pitch_weight = pitch_weight
+
+    @staticmethod
+    def prepare(audio):
+        """A file path, or a mono float32 numpy array at 16 kHz -> the waveform the models see."""
+        return load_audio(audio) if isinstance(audio, str) else pad_audio(
+            normalize_loudness(np.asarray(audio, dtype=np.float32)))
 
     @torch.no_grad()
+    def model_probs(self, wav):
+        """One probs object per model (before combining or pitch)."""
+        out = []
+        for model, fe in self.models:
+            feats = fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+            logits = model(feats["input_values"].to(self.device))
+            per_head = {}
+            for head in HEADS:
+                log_probs = F.log_softmax(logits[head][0].float(), dim=-1).cpu()
+                scores, silence = single_unit_scores(log_probs)
+                p = torch.softmax(torch.cat([scores, silence.view(1)]), dim=0).tolist()
+                per_head[head] = dict(zip(VOCABS[head][1:], p[:-1]))
+                per_head[head]["<silence>"] = p[-1]
+            out.append(per_head)
+        return out
+
+    def pitch_vote(self, wav):
+        return self.pitch.vote(wav) if self.pitch is not None else None
+
+    def probs(self, audio):
+        wav = self.prepare(audio)
+        return apply_pitch(combine(self.model_probs(wav)), self.pitch_vote(wav), self.pitch_weight)
+
     def score(self, audio, target, threshold=DEFAULT_THRESHOLD, top_k=3):
-        """audio: a file path, or a mono float32 numpy array at 16 kHz.
-
-        A part counts as correct unless the model gives the target less than `threshold`
-        probability. "heard" is still the model's top guess, so it can differ from the
-        target on a part that is marked correct; that means "close enough"."""
-        parts = split_syllable(target)
-        if parts is None:
-            raise ValueError(f"not a pinyin syllable with tone: {target!r}")
-        wav = load_audio(audio) if isinstance(audio, str) else pad_audio(
-            normalize_loudness(np.asarray(audio, dtype=np.float32)))
-        feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-        logits = self.model(feats["input_values"].to(self.device))
-
-        result = {"target": target, "parts": {}}
-        silence_probs = []
-        for head, want in zip(HEADS, parts):
-            log_probs = F.log_softmax(logits[head][0].float(), dim=-1).cpu()
-            scores, silence = single_unit_scores(log_probs)
-            probs = torch.softmax(torch.cat([scores, silence.view(1)]), dim=0)
-            silence_probs.append(probs[-1].item())
-            units = VOCABS[head][1:]
-            ranked = sorted(zip(units, probs[:-1].tolist()), key=lambda x: -x[1])
-            probs_by_unit = dict(ranked)
-            forgiven = FORGIVE.get(head, {}).get(want, ())
-            score = probs_by_unit[want] + sum(probs_by_unit[u] for u in forgiven)
-            heard = ranked[0][0]
-            result["parts"][head] = {
-                "target": display(head, want),
-                "heard": display(head, heard),
-                "target_unit": want,
-                "heard_unit": heard,
-                "score": round(score, 4),
-                "correct": score >= threshold,
-                "forgiven": heard in forgiven,   # top guess was an accepted partner, e.g. ang for eng
-                "top": [(display(head, u), round(pr, 4)) for u, pr in ranked[:top_k]],
-            }
-        result["no_speech"] = min(silence_probs) > 0.5
-        result["understood"] = (not result["no_speech"]
-                                and all(p["correct"] for p in result["parts"].values()))
-        return result
+        """A part counts as correct unless the target (plus any forgiven partner) gets less than
+        `threshold` probability. "heard" is still the top guess, so it can differ from the target on
+        a part that is marked correct; that means "close enough" (or "forgiven")."""
+        return judge(self.probs(audio), target, threshold, top_k)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", nargs="+", required=True, help="one or more model folders")
+    p.add_argument("--pitch-model", default=None, help="saved tone 2/3 pitch classifier (.joblib)")
     p.add_argument("--audio", required=True)
     p.add_argument("--target", required=True, help="e.g. zhuang4, lv4, yi1")
     p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     args = p.parse_args()
-    result = Scorer(args.model).score(args.audio, args.target, args.threshold)
+    result = Scorer(args.model, pitch_model=args.pitch_model).score(args.audio, args.target, args.threshold)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
