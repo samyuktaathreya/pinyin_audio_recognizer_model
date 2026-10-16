@@ -138,14 +138,28 @@ def judge(probs, target, threshold=DEFAULT_THRESHOLD, top_k=3, forgive=FORGIVE):
 
 # ---------------------------------------------------------------- the scorer
 class Scorer:
-    def __init__(self, model_dirs, device=None, pitch_model=None, pitch_weight=PITCH_WEIGHT):
+    def __init__(self, model_dirs, device=None, pitch_model=None, pitch_weight=PITCH_WEIGHT,
+                 quantize=False, threads=None):
         """model_dirs: one model folder or a list of them (probabilities are averaged).
-        pitch_model: path to the saved tone 2/3 pitch classifier, or None to skip it."""
+        pitch_model: path to the saved tone 2/3 pitch classifier, or None to skip it.
+        quantize: store the models' linear layers as 8-bit integers (CPU only). About 4x less memory
+            for the weights and usually faster on CPU; check accuracy with quant_check.py first.
+        threads: CPU threads for PyTorch (e.g. the number of cores on the server)."""
+        import gc
         if isinstance(model_dirs, str):
             model_dirs = [model_dirs]
+        if threads:
+            torch.set_num_threads(threads)
+        if quantize:
+            device = "cpu"
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.models = [(PinyinCTC.load(m).to(self.device).eval(), PinyinCTC.load_feature_extractor(m))
-                       for m in model_dirs]
+        self.models = []
+        for m in model_dirs:                      # one at a time, so peak memory stays low
+            net = PinyinCTC.load(m).eval()
+            if quantize:
+                net = torch.quantization.quantize_dynamic(net, {torch.nn.Linear}, dtype=torch.qint8)
+            self.models.append((net.to(self.device), PinyinCTC.load_feature_extractor(m)))
+            gc.collect()
         self.model, self.fe = self.models[0]      # for older scripts that use these directly
         self.pitch = None
         if pitch_model:
@@ -197,8 +211,10 @@ def main():
     p.add_argument("--audio", required=True)
     p.add_argument("--target", required=True, help="e.g. zhuang4, lv4, yi1")
     p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    p.add_argument("--quantize", action="store_true", help="8-bit linear layers, CPU only")
     args = p.parse_args()
-    result = Scorer(args.model, pitch_model=args.pitch_model).score(args.audio, args.target, args.threshold)
+    result = Scorer(args.model, pitch_model=args.pitch_model, quantize=args.quantize).score(
+        args.audio, args.target, args.threshold)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

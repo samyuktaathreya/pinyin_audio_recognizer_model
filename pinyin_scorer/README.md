@@ -384,6 +384,19 @@ clips with 6b + 7; FV3 0, MV3 1). What was established:
   Capping creak dips, dropping rise/end measures, and a plain "dip deeper than 1.8 semitones =
   tone 3" rule were all tried and were no better.
 
+### Creaky voice and half third tones (no rule needed)
+- **Creak** (`pitch_tone.creak_fraction`: share of the syllable's middle with no pitch or half
+  pitch) is common in tone 3 for several voices (yabla 90%, mandarintemple 84%, MV1 80% of clips at
+  ≥ 20% creak) but also in tone 4 (MV1 48%, uvm 36%, MV3 20%), and almost never in tones 1 and 2.
+  A rule "target tone 3 + creaky → tone passes" removed no false alarms (the model already handles
+  creaky tone 3) and would accept a creaky tone 4 for tone 3 4.6–30.5% of the time (0.2% now).
+- **Half third** (tone 3 that falls low and stays low, as in speech): made from every native tone 3
+  clip by holding the pitch low after its lowest point (Praat resynthesis; length and final kept).
+  The current `score.py` passes the tone on 93% (FV3), 99–100% (MV3, studycli, uvm). A pitch
+  classifier for half third vs tones 1/2/4 added nothing and let tone 4 through (3–25%). Cutting
+  the clip off at the lowest point instead (first attempt) made clips that looked like a short
+  tone 4 and only passed 54–94%; don't use that construction.
+
 ### Other findings
 - **Rare finals are barely learned:** `yo` (final `io`) fails every time, `weng` (`ueng`) about
   half the time, bare `o` often heard as `ou`. Consider leaving `yo` out of drills.
@@ -409,6 +422,8 @@ clips with 6b + 7; FV3 0, MV3 1). What was established:
 - **Pitch vote on tone 2 vs 3 at `PITCH_WEIGHT = 0.3`**, classifier `tone23_pitch.joblib`
   (trained on the 8 training voices, notebook cell 12).
 - **Stage 8 / `--praat-augment` not adopted** (section 6).
+- **No special rule for creaky voice or half third tones.** The current `score.py` already passes
+  them for tone 3 targets, and every rule tried mainly let tone 4 through (section 7).
 - **Speed:** not optimised; 44 ms per call on a T4 is well within budget. Check on the server.
 - `pinyin_units.py` is unchanged; changing the vocabulary would break loading saved models.
 
@@ -416,18 +431,17 @@ clips with 6b + 7; FV3 0, MV3 1). What was established:
 
 ## 9. Next steps (in order)
 
-1. **Creaky voice counts as tone 3** (in progress): when the target is tone 3 and the clip is
-   creaky in the middle of the syllable, accept the tone. Measure first how often tones 1, 2 and
-   4 are creaky too, since that is the cost.
-2. **Measure speed on the server hardware** (CPU-only could be several times slower than 44 ms).
-3. **Record real learners through the app's browser pipeline** and have a native listener judge
+1. **Measure speed on the server hardware** (CPU-only could be several times slower than 44 ms).
+2. **Record real learners through the app's browser pipeline** and have a native listener judge
    them. This gives the real false-alarm rate, and checks compression and noise suppression.
-4. **Fresh test set:** cut syllables out of unseen AISHELL speakers (CTC forced alignment with
+   Include half third tones (tone 3 without the rise) and creaky tone 3s: both pass on synthetic
+   tests (section 7), but real learner versions may differ.
+3. **Fresh test set:** cut syllables out of unseen AISHELL speakers (CTC forced alignment with
    the current model; prefer long, phrase-final syllables). Needed because the four held-out
    voices have been used for tuning. The same pipeline gives more training voices.
-5. **Remaining errors:** studycli tone 2/3 (~7% of its clips): feed the pitch contour into the
+4. **Remaining errors:** studycli tone 2/3 (~7% of its clips): feed the pitch contour into the
    tone head and retrain, ideally with more voices. uvm: look at which initials it misses.
-6. **Channel augmentation** (random EQ curves, low cuts, band limits) if real learner recordings
+5. **Channel augmentation** (random EQ curves, low cuts, band limits) if real learner recordings
    show channel-related errors.
 
 Ideas tried and set aside: TTS-generated training clips (unreliable for single syllables);
