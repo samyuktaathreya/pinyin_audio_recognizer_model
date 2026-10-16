@@ -51,6 +51,32 @@ def contour(wav, sr=SAMPLE_RATE):
         return c, (float(mid.mean()) if len(mid) else 0.0)
 
 
+def creak_fraction(wav, sr=SAMPLE_RATE, lo=0.2, hi=0.8):
+    """Share of the middle of the syllable (lo-hi of the voiced span) that is creaky: frames where
+    Praat finds no pitch inside the syllable, or tracks about half the pitch (more than 10 semitones
+    below the clip's own median; a real tone 3 dip is about 3-7). None if no pitch was found."""
+    import parselmouth
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        snd = parselmouth.Sound(np.asarray(wav, dtype=np.float64), sampling_frequency=sr)
+        f = snd.to_pitch(time_step=0.01, pitch_floor=75, pitch_ceiling=600).selected_array["frequency"]
+        if (f > 0).sum() < 8:
+            return None
+        med = float(np.median(f[f > 0]))
+        f = snd.to_pitch(time_step=0.01, pitch_floor=max(60, med / 2.2),
+                         pitch_ceiling=min(800, med * 2.2)).selected_array["frequency"]
+        v = np.where(f > 0)[0]
+        if len(v) < 8:
+            return None
+        seg = f[v[0]:v[-1] + 1].astype(float)
+        gaps = seg <= 0
+        st = 12 * np.log2(np.maximum(seg, 1) / med)
+        halved = (~gaps) & (st < -10)
+        creaky = gaps | halved
+        a, b = int(lo * len(seg)), int(hi * len(seg)) + 1
+        return float(creaky[a:b].mean()) if b > a else 0.0
+
+
 def features_from_contour(c, creak):
     c = np.asarray(c, dtype=float)
     inner = c[2:-2]
