@@ -14,13 +14,21 @@ import argparse
 import json
 import pickle
 import random
-import resource
 import time
 
 
 def rss_mb():
     with open("/proc/self/statm") as f:
         return int(f.read().split()[1]) * 4096 / 1e6
+
+
+def peak_mb():
+    """Highest memory this process has used. (getrusage's figure is wrong here: after `!python` it
+    includes the notebook process it was started from.)"""
+    for line in open("/proc/self/status"):
+        if line.startswith("VmHWM:"):
+            return int(line.split()[1]) / 1024
+    return float("nan")
 
 
 def main():
@@ -73,7 +81,7 @@ def main():
             print(f"  {i}/{len(clips)}", flush=True)
     pickle.dump(out, open(args.out, "wb"))
 
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    peak = peak_mb()
     ms = 1000 * sorted(times)[len(times) // 2]
     p90 = 1000 * sorted(times)[int(0.9 * len(times))]
     print(f"\nPEAK MEMORY: {peak:.0f} MB    (server has ~1,300 MB free)")
