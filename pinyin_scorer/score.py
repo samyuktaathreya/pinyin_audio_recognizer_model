@@ -29,6 +29,15 @@ from pinyin_units import HEADS, VOCABS, display, split_syllable
 # on easily confused pairs slipped through 1 to 3% of the time.
 DEFAULT_THRESHOLD = 0.05
 
+# Answers accepted in place of the target, per head. The partner's probability is added to the
+# target's before the threshold is applied, so a clip heard as the partner still counts as correct.
+# One-directional: {"eng": ("ang",)} forgives eng heard as ang, but ang heard as eng is still flagged.
+# eng/ang: the model can't reliably tell an open eng from ang on unfamiliar voices (Oct 2026), and
+# borderline eng is often accepted by native listeners when the intended word is known.
+FORGIVE = {
+    "final": {"eng": ("ang",)},
+}
+
 
 def single_unit_scores(log_probs):
     """log_probs: (T, C) with blank at 0.
@@ -78,7 +87,9 @@ class Scorer:
             silence_probs.append(probs[-1].item())
             units = VOCABS[head][1:]
             ranked = sorted(zip(units, probs[:-1].tolist()), key=lambda x: -x[1])
-            score = dict(ranked)[want]
+            probs_by_unit = dict(ranked)
+            forgiven = FORGIVE.get(head, {}).get(want, ())
+            score = probs_by_unit[want] + sum(probs_by_unit[u] for u in forgiven)
             heard = ranked[0][0]
             result["parts"][head] = {
                 "target": display(head, want),
@@ -87,6 +98,7 @@ class Scorer:
                 "heard_unit": heard,
                 "score": round(score, 4),
                 "correct": score >= threshold,
+                "forgiven": heard in forgiven,   # top guess was an accepted partner, e.g. ang for eng
                 "top": [(display(head, u), round(pr, 4)) for u, pr in ranked[:top_k]],
             }
         result["no_speech"] = min(silence_probs) > 0.5
